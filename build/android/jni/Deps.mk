@@ -1,8 +1,7 @@
 APP_PLATFORM := ${APP_PLATFORM}
 APP_ABI := ${TARGET_ABI}
-APP_STL := gnustl_static
-NDK_TOOLCHAIN_VERSION := 4.9
+APP_STL := c++_shared
 APP_DEPRECATED_HEADERS := true
 
-APP_CLAFGS += -mfloat-abi=softfp -mfpu=vfpv3 -O3
-APP_CPPFLAGS += -fexceptions
+APP_CFLAGS += ${TARGET_CFLAGS_ADDON}
+APP_CPPFLAGS += ${TARGET_CXXFLAGS_ADDON} -fexceptions -std=c++11

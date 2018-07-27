@@ -109,12 +109,12 @@ int NodeMetaRef::l_mark_as_private(lua_State *L)
 		while (lua_next(L, 2) != 0) {
 			// key at index -2 and value at index -1
 			luaL_checktype(L, -1, LUA_TSTRING);
-			meta->markPrivate(lua_tostring(L, -1), true);
+			meta->markPrivate(readParam<std::string>(L, -1), true);
 			// removes value, keeps key for next iteration
 			lua_pop(L, 1);
 		}
 	} else if (lua_isstring(L, 2)) {
-		meta->markPrivate(lua_tostring(L, 2), true);
+		meta->markPrivate(readParam<std::string>(L, 2), true);
 	}
 	ref->reportMetadataChange();
 
@@ -242,6 +242,8 @@ void NodeMetaRef::Register(lua_State *L)
 
 
 const luaL_Reg NodeMetaRef::methodsServer[] = {
+	luamethod(MetaDataRef, contains),
+	luamethod(MetaDataRef, get),
 	luamethod(MetaDataRef, get_string),
 	luamethod(MetaDataRef, set_string),
 	luamethod(MetaDataRef, get_int),
@@ -266,6 +268,8 @@ void NodeMetaRef::RegisterClient(lua_State *L)
 
 
 const luaL_Reg NodeMetaRef::methodsClient[] = {
+	luamethod(MetaDataRef, contains),
+	luamethod(MetaDataRef, get),
 	luamethod(MetaDataRef, get_string),
 	luamethod(MetaDataRef, get_int),
 	luamethod(MetaDataRef, get_float),

@@ -1159,7 +1159,10 @@ ServerMap::ServerMap(const std::string &savedir, IGameDef *gamedef,
 	}
 	std::string backend = conf.get("backend");
 	dbase = createDatabase(backend, savedir, conf);
-
+	if (conf.exists("readonly_backend")) {
+		std::string readonly_dir = savedir + DIR_DELIM + "readonly";
+		dbase_ro = createDatabase(conf.get("readonly_backend"), readonly_dir, conf);
+	}
 	if (!conf.updateConfigFile(conf_path.c_str()))
 		errorstream << "ServerMap::ServerMap(): Failed to update world.mt!" << std::endl;
 
@@ -1230,6 +1233,8 @@ ServerMap::~ServerMap()
 		Close database if it was opened
 	*/
 	delete dbase;
+	if (dbase_ro)
+		delete dbase_ro;
 
 #if 0
 	/*
@@ -1259,11 +1264,6 @@ u64 ServerMap::getSeed()
 s16 ServerMap::getWaterLevel()
 {
 	return getMapgenParams()->water_level;
-}
-
-bool ServerMap::saoPositionOverLimit(const v3f &p)
-{
-	return getMapgenParams()->saoPosOverLimit(p);
 }
 
 bool ServerMap::blockpos_over_mapgen_limit(v3s16 p)
@@ -1732,13 +1732,13 @@ std::string ServerMap::getSectorDir(v2s16 pos, int layout)
 	switch(layout)
 	{
 		case 1:
-			snprintf(cc, 9, "%.4x%.4x",
+			porting::mt_snprintf(cc, sizeof(cc), "%.4x%.4x",
 				(unsigned int) pos.X & 0xffff,
 				(unsigned int) pos.Y & 0xffff);
 
 			return m_savedir + DIR_DELIM + "sectors" + DIR_DELIM + cc;
 		case 2:
-			snprintf(cc, 9, (std::string("%.3x") + DIR_DELIM + "%.3x").c_str(),
+			porting::mt_snprintf(cc, sizeof(cc), (std::string("%.3x") + DIR_DELIM + "%.3x").c_str(),
 				(unsigned int) pos.X & 0xfff,
 				(unsigned int) pos.Y & 0xfff);
 
@@ -1796,7 +1796,7 @@ v3s16 ServerMap::getBlockPos(const std::string &sectordir, const std::string &bl
 std::string ServerMap::getBlockFilename(v3s16 p)
 {
 	char cc[5];
-	snprintf(cc, 5, "%.4x", (unsigned int)p.Y&0xffff);
+	porting::mt_snprintf(cc, sizeof(cc), "%.4x", (unsigned int)p.Y&0xffff);
 	return cc;
 }
 
@@ -1874,6 +1874,8 @@ void ServerMap::listAllLoadableBlocks(std::vector<v3s16> &dst)
 				<< "all blocks that are stored in flat files." << std::endl;
 	}
 	dbase->listAllLoadableBlocks(dst);
+	if (dbase_ro)
+		dbase_ro->listAllLoadableBlocks(dst);
 }
 
 void ServerMap::listAllLoadedBlocks(std::vector<v3s16> &dst)
@@ -2112,6 +2114,11 @@ MapBlock* ServerMap::loadBlock(v3s16 blockpos)
 	dbase->loadBlock(blockpos, &ret);
 	if (!ret.empty()) {
 		loadBlock(&ret, blockpos, createSector(p2d), false);
+	} else if (dbase_ro) {
+		dbase_ro->loadBlock(blockpos, &ret);
+		if (!ret.empty()) {
+			loadBlock(&ret, blockpos, createSector(p2d), false);
+		}
 	} else {
 		// Not found in database, try the files
 
@@ -2243,7 +2250,7 @@ void MMVManip::initialEmerge(v3s16 blockpos_min, v3s16 blockpos_max,
 		bool block_data_inexistent = false;
 		try
 		{
-			TimeTaker timer1("emerge load", &emerge_load_time);
+			TimeTaker timer2("emerge load", &emerge_load_time);
 
 			block = m_map->getBlockNoCreate(p);
 			if(block->isDummy())

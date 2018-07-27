@@ -18,6 +18,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 */
 
 #include "collision.h"
+#include <cmath>
 #include "mapblock.h"
 #include "map.h"
 #include "nodedef.h"
@@ -279,7 +280,7 @@ collisionMoveResult collisionMoveSimple(Environment *env, IGameDef *gamedef,
 		bool is_position_valid;
 		MapNode n = map->getNodeNoEx(p, &is_position_valid);
 
-		if (is_position_valid) {
+		if (is_position_valid && n.getContent() != CONTENT_IGNORE) {
 			// Object collides into walkable nodes
 
 			any_position_valid = true;
@@ -321,13 +322,17 @@ collisionMoveResult collisionMoveSimple(Environment *env, IGameDef *gamedef,
 			}
 			std::vector<aabb3f> nodeboxes;
 			n.getCollisionBoxes(gamedef->ndef(), &nodeboxes, neighbors);
+
+			// Calculate float position only once
+			v3f posf = intToFloat(p, BS);
 			for (auto box : nodeboxes) {
-				box.MinEdge += intToFloat(p, BS);
-				box.MaxEdge += intToFloat(p, BS);
+				box.MinEdge += posf;
+				box.MaxEdge += posf;
 				cinfo.emplace_back(false, false, n_bouncy_value, p, box);
 			}
 		} else {
-			// Collide with unloaded nodes
+			// Collide with unloaded nodes (position invalid) and loaded
+			// CONTENT_IGNORE nodes (position valid)
 			aabb3f box = getNodeBox(p, BS);
 			cinfo.emplace_back(true, false, 0, p, box);
 		}
@@ -335,6 +340,8 @@ collisionMoveResult collisionMoveSimple(Environment *env, IGameDef *gamedef,
 
 	// Do not move if world has not loaded yet, since custom node boxes
 	// are not available for collision detection.
+	// This also intentionally occurs in the case of the object being positioned
+	// solely on loaded CONTENT_IGNORE nodes, no matter where they come from.
 	if (!any_position_valid) {
 		*speed_f = v3f(0, 0, 0);
 		return result;
@@ -433,7 +440,7 @@ collisionMoveResult collisionMoveSimple(Environment *env, IGameDef *gamedef,
 			Go through every nodebox, find nearest collision
 		*/
 		for (u32 boxindex = 0; boxindex < cinfo.size(); boxindex++) {
-			NearbyCollisionInfo box_info = cinfo[boxindex];
+			const NearbyCollisionInfo &box_info = cinfo[boxindex];
 			// Ignore if already stepped up this nodebox.
 			if (box_info.is_step_up)
 				continue;
@@ -561,7 +568,7 @@ collisionMoveResult collisionMoveSimple(Environment *env, IGameDef *gamedef,
 				box.MinEdge += *pos_f;
 				box.MaxEdge += *pos_f;
 			}
-			if (fabs(cbox.MaxEdge.Y - box.MinEdge.Y) < 0.15f * BS) {
+			if (std::fabs(cbox.MaxEdge.Y - box.MinEdge.Y) < 0.15f * BS) {
 				result.touching_ground = true;
 
 				if (box_info.is_object)

@@ -30,6 +30,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "genericobject.h"
 #include "settings.h"
 #include <algorithm>
+#include <cmath>
 
 std::map<u16, ServerActiveObject::Factory> ServerActiveObject::m_types;
 
@@ -186,11 +187,17 @@ void UnitSAO::setAttachment(int parent_id, const std::string &bone, v3f position
 	// This breaks some things so we also give the server the most accurate representation
 	// even if players only see the client changes.
 
+	int old_parent = m_attachment_parent_id;
 	m_attachment_parent_id = parent_id;
 	m_attachment_bone = bone;
 	m_attachment_position = position;
 	m_attachment_rotation = rotation;
 	m_attachment_sent = false;
+
+	if (parent_id != old_parent) {
+		onDetach(old_parent);
+		onAttach(parent_id);
+	}
 }
 
 void UnitSAO::getAttachment(int *parent_id, std::string *bone, v3f *position,
@@ -200,6 +207,30 @@ void UnitSAO::getAttachment(int *parent_id, std::string *bone, v3f *position,
 	*bone = m_attachment_bone;
 	*position = m_attachment_position;
 	*rotation = m_attachment_rotation;
+}
+
+void UnitSAO::clearChildAttachments()
+{
+	for (int child_id : m_attachment_child_ids) {
+		// Child can be NULL if it was deleted earlier
+		if (ServerActiveObject *child = m_env->getActiveObject(child_id))
+			child->setAttachment(0, "", v3f(0, 0, 0), v3f(0, 0, 0));
+	}
+	m_attachment_child_ids.clear();
+}
+
+void UnitSAO::clearParentAttachment()
+{
+	ServerActiveObject *parent = nullptr;
+	if (m_attachment_parent_id) {
+		parent = m_env->getActiveObject(m_attachment_parent_id);
+		setAttachment(0, "", m_attachment_position, m_attachment_rotation);
+	} else {
+		setAttachment(0, "", v3f(0, 0, 0), v3f(0, 0, 0));
+	}
+	// Do it
+	if (parent)
+		parent->removeAttachmentChild(m_id);
 }
 
 void UnitSAO::addAttachmentChild(int child_id)
@@ -215,6 +246,38 @@ void UnitSAO::removeAttachmentChild(int child_id)
 const std::unordered_set<int> &UnitSAO::getAttachmentChildIds()
 {
 	return m_attachment_child_ids;
+}
+
+void UnitSAO::onAttach(int parent_id)
+{
+	if (!parent_id)
+		return;
+
+	ServerActiveObject *parent = m_env->getActiveObject(parent_id);
+
+	if (!parent || parent->isGone())
+		return; // Do not try to notify soon gone parent
+
+	if (parent->getType() == ACTIVEOBJECT_TYPE_LUAENTITY) {
+		// Call parent's on_attach field
+		m_env->getScriptIface()->luaentity_on_attach_child(parent_id, this);
+	}
+}
+
+void UnitSAO::onDetach(int parent_id)
+{
+	if (!parent_id)
+		return;
+
+	ServerActiveObject *parent = m_env->getActiveObject(parent_id);
+	if (getType() == ACTIVEOBJECT_TYPE_LUAENTITY)
+		m_env->getScriptIface()->luaentity_on_detach(m_id, parent);
+
+	if (!parent || parent->isGone())
+		return; // Do not try to notify soon gone parent
+
+	if (parent->getType() == ACTIVEOBJECT_TYPE_LUAENTITY)
+		m_env->getScriptIface()->luaentity_on_detach_child(parent_id, this);
 }
 
 ObjectProperties* UnitSAO::accessObjectProperties()
@@ -395,19 +458,6 @@ void LuaEntitySAO::step(float dtime, bool send_recommended)
 		m_env->getScriptIface()->luaentity_Step(m_id, dtime);
 	}
 
-	// Remove LuaEntity beyond terrain edges
-	{
-		ServerMap *map = dynamic_cast<ServerMap *>(&m_env->getMap());
-		assert(map);
-		if (!m_pending_removal &&
-				map->saoPositionOverLimit(m_base_position)) {
-			infostream << "Removing SAO " << m_id << "(" << m_init_name
-				<< "), outside of limits" << std::endl;
-			m_pending_removal = true;
-			return;
-		}
-	}
-
 	if (!send_recommended)
 		return;
 
@@ -423,8 +473,8 @@ void LuaEntitySAO::step(float dtime, bool send_recommended)
 		float move_d = m_base_position.getDistanceFrom(m_last_sent_position);
 		move_d += m_last_sent_move_precision;
 		float vel_d = m_velocity.getDistanceFrom(m_last_sent_velocity);
-		if(move_d > minchange || vel_d > minchange ||
-				fabs(m_yaw - m_last_sent_yaw) > 1.0){
+		if (move_d > minchange || vel_d > minchange ||
+				std::fabs(m_yaw - m_last_sent_yaw) > 1.0) {
 			sendPosition(true, false);
 		}
 	}
@@ -557,10 +607,6 @@ int LuaEntitySAO::punch(v3f dir,
 		return 0;
 	}
 
-	// It's best that attachments cannot be punched
-	if (isAttached())
-		return 0;
-
 	ItemStack *punchitem = NULL;
 	ItemStack punchitem_static;
 	if (puncher) {
@@ -579,7 +625,8 @@ int LuaEntitySAO::punch(v3f dir,
 
 	if (!damage_handled) {
 		if (result.did_punch) {
-			setHP(getHP() - result.damage);
+			setHP(getHP() - result.damage,
+				PlayerHPChangeReason(PlayerHPChangeReason::SET_HP));
 
 			if (result.damage > 0) {
 				std::string punchername = puncher ? puncher->getDescription() : "nil";
@@ -596,8 +643,10 @@ int LuaEntitySAO::punch(v3f dir,
 		}
 	}
 
-	if (getHP() == 0) {
+	if (getHP() == 0 && !isGone()) {
 		m_pending_removal = true;
+		clearParentAttachment();
+		clearChildAttachments();
 		m_env->getScriptIface()->luaentity_on_death(m_id, puncher);
 	}
 
@@ -608,9 +657,7 @@ void LuaEntitySAO::rightClick(ServerActiveObject *clicker)
 {
 	if (!m_registered)
 		return;
-	// It's best that attachments cannot be clicked
-	if (isAttached())
-		return;
+
 	m_env->getScriptIface()->luaentity_Rightclick(m_id, clicker);
 }
 
@@ -647,9 +694,10 @@ std::string LuaEntitySAO::getDescription()
 	return os.str();
 }
 
-void LuaEntitySAO::setHP(s16 hp)
+void LuaEntitySAO::setHP(s16 hp, const PlayerHPChangeReason &reason)
 {
-	if(hp < 0) hp = 0;
+	if (hp < 0)
+		hp = 0;
 	m_hp = hp;
 }
 
@@ -814,6 +862,7 @@ PlayerSAO::PlayerSAO(ServerEnvironment *env_, RemotePlayer *player_, session_t p
 	m_prop.eye_height = 1.625f;
 	// End of default appearance
 	m_prop.is_visible = true;
+	m_prop.backface_culling = false;
 	m_prop.makes_footstep_sound = true;
 	m_prop.stepheight = PLAYER_DEFAULT_STEPHEIGHT * BS;
 	m_hp = m_prop.hp_max;
@@ -934,8 +983,9 @@ void PlayerSAO::step(float dtime, bool send_recommended)
 
 			// No more breath, damage player
 			if (m_breath == 0) {
-				setHP(m_hp - c.drowning);
-				m_env->getGameDef()->SendPlayerHPOrDie(this);
+				PlayerHPChangeReason reason(PlayerHPChangeReason::DROWNING);
+				setHP(m_hp - c.drowning, reason);
+				m_env->getGameDef()->SendPlayerHPOrDie(this, reason);
 			}
 		}
 	}
@@ -974,8 +1024,9 @@ void PlayerSAO::step(float dtime, bool send_recommended)
 
 		if (damage_per_second != 0 && m_hp > 0) {
 			s16 newhp = ((s32) damage_per_second > m_hp ? 0 : m_hp - damage_per_second);
-			setHP(newhp);
-			m_env->getGameDef()->SendPlayerHPOrDie(this);
+			PlayerHPChangeReason reason(PlayerHPChangeReason::NODE_DAMAGE);
+			setHP(newhp, reason);
+			m_env->getGameDef()->SendPlayerHPOrDie(this, reason);
 		}
 	}
 
@@ -1110,7 +1161,11 @@ void PlayerSAO::setBasePosition(const v3f &position)
 
 	// This needs to be ran for attachments too
 	ServerActiveObject::setBasePosition(position);
-	m_position_not_sent = true;
+
+	// Updating is not wanted/required for player migration
+	if (m_env) {
+		m_position_not_sent = true;
+	}
 }
 
 void PlayerSAO::setPos(const v3f &pos)
@@ -1188,10 +1243,6 @@ int PlayerSAO::punch(v3f dir,
 	ServerActiveObject *puncher,
 	float time_from_last_punch)
 {
-	// It's best that attachments cannot be punched
-	if (isAttached())
-		return 0;
-
 	if (!toolcap)
 		return 0;
 
@@ -1221,7 +1272,8 @@ int PlayerSAO::punch(v3f dir,
 				hitparams.hp);
 
 	if (!damage_handled) {
-		setHP(getHP() - hitparams.hp);
+		setHP(getHP() - hitparams.hp,
+				PlayerHPChangeReason(PlayerHPChangeReason::PLAYER_PUNCH, puncher));
 	} else { // override client prediction
 		if (puncher->getType() == ACTIVEOBJECT_TYPE_PLAYER) {
 			std::string str = gob_cmd_punched(0, getHP());
@@ -1251,11 +1303,11 @@ s16 PlayerSAO::readDamage()
 	return damage;
 }
 
-void PlayerSAO::setHP(s16 hp)
+void PlayerSAO::setHP(s16 hp, const PlayerHPChangeReason &reason)
 {
 	s16 oldhp = m_hp;
 
-	s16 hp_change = m_env->getScriptIface()->on_player_hpchange(this, hp - oldhp);
+	s16 hp_change = m_env->getScriptIface()->on_player_hpchange(this, hp - oldhp, reason);
 	if (hp_change == 0)
 		return;
 	hp = oldhp + hp_change;
@@ -1472,4 +1524,9 @@ bool PlayerSAO::getSelectionBox(aabb3f *toset) const
 	toset->MaxEdge = m_prop.selectionbox.MaxEdge * BS;
 
 	return true;
+}
+
+float PlayerSAO::getZoomFOV() const
+{
+	return m_prop.zoom_fov;
 }

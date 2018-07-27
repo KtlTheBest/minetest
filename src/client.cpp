@@ -30,6 +30,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "client/clientevent.h"
 #include "client/gameui.h"
 #include "client/renderingengine.h"
+#include "client/sound.h"
 #include "client/tile.h"
 #include "util/auth.h"
 #include "util/directiontables.h"
@@ -42,7 +43,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "mapblock.h"
 #include "minimap.h"
 #include "modchannels.h"
-#include "mods.h"
+#include "content/mods.h"
 #include "profiler.h"
 #include "shader.h"
 #include "gettext.h"
@@ -129,13 +130,14 @@ void Client::loadMods()
 		return;
 	}
 
-	// If modding is not enabled or flavour disable it, don't load mods, just builtin
+	// If modding is not enabled or CSM restrictions disable it
+	// don't load CSM mods, only builtin
 	if (!m_modding_enabled) {
 		warningstream << "Client side mods are disabled by configuration." << std::endl;
 		return;
 	}
 
-	if (checkCSMFlavourLimit(CSMFlavourLimit::CSM_FL_LOAD_CLIENT_MODS)) {
+	if (checkCSMRestrictionFlag(CSMRestrictionFlags::CSM_RF_LOAD_CLIENT_MODS)) {
 		warningstream << "Client side mods are disabled by server." << std::endl;
 		// If mods loading is disabled and builtin integrity is wrong, disconnect user.
 		if (!checkBuiltinIntegrity()) {
@@ -171,6 +173,8 @@ void Client::loadMods()
 	for (const ModSpec &mod : m_mods)
 		m_script->loadModFromMemory(mod.name);
 
+	// Run a callback when mods are loaded
+	m_script->on_mods_loaded();
 	m_mods_loaded = true;
 }
 
@@ -246,6 +250,8 @@ Client::~Client()
 	m_shutdown = true;
 	m_con->Disconnect();
 
+	deleteAuthData();
+
 	m_mesh_update_thread.stop();
 	m_mesh_update_thread.wait();
 	while (!m_mesh_update_thread.m_queue_out.empty()) {
@@ -270,6 +276,7 @@ Client::~Client()
 	}
 
 	delete m_minimap;
+	delete m_media_downloader;
 }
 
 void Client::connect(Address address, bool is_local_server)
@@ -434,7 +441,7 @@ void Client::step(float dtime)
 		counter = 0.0;
 		// connectedAndInitialized() is true, peer exists.
 		float avg_rtt = getRTT();
-		infostream << "Client: avg_rtt=" << avg_rtt << std::endl;
+		infostream << "Client: average rtt: " << avg_rtt << std::endl;
 	}
 
 	/*
@@ -522,21 +529,18 @@ void Client::step(float dtime)
 		the local inventory (so the player notices the lag problem
 		and knows something is wrong).
 	*/
-	if(m_inventory_from_server)
-	{
-		float interval = 10.0;
-		float count_before = floor(m_inventory_from_server_age / interval);
+	if (m_inventory_from_server) {
+		float interval = 10.0f;
+		float count_before = std::floor(m_inventory_from_server_age / interval);
 
 		m_inventory_from_server_age += dtime;
 
-		float count_after = floor(m_inventory_from_server_age / interval);
+		float count_after = std::floor(m_inventory_from_server_age / interval);
 
-		if(count_after != count_before)
-		{
+		if (count_after != count_before) {
 			// Do this every <interval> seconds after TOCLIENT_INVENTORY
 			// Reset the locally changed inventory to the authoritative inventory
-			LocalPlayer *player = m_env.getLocalPlayer();
-			player->inventory = *m_inventory_from_server;
+			m_env.getLocalPlayer()->inventory = *m_inventory_from_server;
 			m_inventory_updated = true;
 		}
 	}
@@ -1282,16 +1286,16 @@ void Client::removeNode(v3s16 p)
 
 /**
  * Helper function for Client Side Modding
- * Flavour is applied there, this should not be used for core engine
+ * CSM restrictions are applied there, this should not be used for core engine
  * @param p
  * @param is_valid_position
  * @return
  */
 MapNode Client::getNode(v3s16 p, bool *is_valid_position)
 {
-	if (checkCSMFlavourLimit(CSMFlavourLimit::CSM_FL_LOOKUP_NODES)) {
+	if (checkCSMRestrictionFlag(CSMRestrictionFlags::CSM_RF_LOOKUP_NODES)) {
 		v3s16 ppos = floatToInt(m_env.getLocalPlayer()->getPosition(), BS);
-		if ((u32) ppos.getDistanceFrom(p) > m_csm_noderange_limit) {
+		if ((u32) ppos.getDistanceFrom(p) > m_csm_restriction_noderange) {
 			*is_valid_position = false;
 			return {};
 		}
@@ -1706,9 +1710,17 @@ void Client::afterContentReceived()
 	delete[] text;
 }
 
+// returns the Round Trip Time
+// if the RTT did not become updated within 2 seconds, e.g. before timing out,
+// it returns the expired time instead
 float Client::getRTT()
 {
-	return m_con->getPeerStat(PEER_ID_SERVER,con::AVG_RTT);
+	float avg_rtt = m_con->getPeerStat(PEER_ID_SERVER, con::AVG_RTT);
+	float time_from_last_rtt =
+		m_con->getPeerStat(PEER_ID_SERVER, con::TIMEOUT_COUNTER);
+	if (avg_rtt + 2.0f > time_from_last_rtt)
+		return avg_rtt;
+	return time_from_last_rtt;
 }
 
 float Client::getCurRate()

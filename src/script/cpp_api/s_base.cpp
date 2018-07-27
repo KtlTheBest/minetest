@@ -24,7 +24,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "common/c_converter.h"
 #include "serverobject.h"
 #include "filesys.h"
-#include "mods.h"
+#include "content/mods.h"
 #include "porting.h"
 #include "util/string.h"
 #include "server.h"
@@ -43,6 +43,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdarg>
 #include "script/common/c_content.h"
+#include "content_sao.h"
 #include <sstream>
 
 
@@ -132,7 +133,7 @@ int ScriptApiBase::luaPanic(lua_State *L)
 {
 	std::ostringstream oss;
 	oss << "LUA PANIC: unprotected error in call to Lua API ("
-		<< lua_tostring(L, -1) << ")";
+		<< readParam<std::string>(L, -1) << ")";
 	FATAL_ERROR(oss.str().c_str());
 	// NOTREACHED
 	return 0;
@@ -151,7 +152,7 @@ void ScriptApiBase::clientOpenLibs(lua_State *L)
 		{ LUA_JITLIBNAME,  luaopen_jit     },
 #endif
 	};
-	
+
 	for (const std::pair<std::string, lua_CFunction> &lib : m_libs) {
 	    lua_pushcfunction(L, lib.second);
 	    lua_pushstring(L, lib.first.c_str());
@@ -183,7 +184,7 @@ void ScriptApiBase::loadScript(const std::string &script_path)
 	}
 	ok = ok && !lua_pcall(L, 0, 0, error_handler);
 	if (!ok) {
-		std::string error_msg = lua_tostring(L, -1);
+		std::string error_msg = readParam<std::string>(L, -1);
 		lua_pop(L, 2); // Pop error message and error handler
 		throw ModError("Failed to load and run script from " +
 				script_path + ":\n" + error_msg);
@@ -285,14 +286,14 @@ void ScriptApiBase::stackDump(std::ostream &o)
 		int t = lua_type(m_luastack, i);
 		switch (t) {
 			case LUA_TSTRING:  /* strings */
-				o << "\"" << lua_tostring(m_luastack, i) << "\"";
+				o << "\"" << readParam<std::string>(m_luastack, i) << "\"";
 				break;
 			case LUA_TBOOLEAN:  /* booleans */
-				o << (lua_toboolean(m_luastack, i) ? "true" : "false");
+				o << (readParam<bool>(m_luastack, i) ? "true" : "false");
 				break;
 			case LUA_TNUMBER:  /* numbers */ {
 				char buf[10];
-				snprintf(buf, 10, "%lf", lua_tonumber(m_luastack, i));
+				porting::mt_snprintf(buf, sizeof(buf), "%lf", lua_tonumber(m_luastack, i));
 				o << buf;
 				break;
 			}
@@ -378,6 +379,26 @@ void ScriptApiBase::objectrefGetOrCreate(lua_State *L,
 			warningstream << "ScriptApiBase::objectrefGetOrCreate(): "
 					<< "Pushing ObjectRef to removed/deactivated object"
 					<< ", this is probably a bug." << std::endl;
+	}
+}
+
+void ScriptApiBase::pushPlayerHPChangeReason(lua_State *L, const PlayerHPChangeReason &reason)
+{
+	if (reason.lua_reference >= 0) {
+		lua_rawgeti(L, LUA_REGISTRYINDEX, reason.lua_reference);
+		luaL_unref(L, LUA_REGISTRYINDEX, reason.lua_reference);
+	} else
+		lua_newtable(L);
+
+	lua_pushstring(L, reason.getTypeAsString().c_str());
+	lua_setfield(L, -2, "type");
+
+	lua_pushstring(L, reason.from_mod ? "mod" : "engine");
+	lua_setfield(L, -2, "from");
+
+	if (reason.object) {
+		objectrefGetOrCreate(L, reason.object);
+		lua_setfield(L, -2, "object");
 	}
 }
 

@@ -49,8 +49,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "content_mapnode.h"
 #include "content_nodemeta.h"
 #include "content_sao.h"
-#include "mods.h"
-#include "event_manager.h"
+#include "content/mods.h"
 #include "modchannels.h"
 #include "serverlist.h"
 #include "util/string.h"
@@ -58,6 +57,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "util/serialize.h"
 #include "util/thread.h"
 #include "defaultsettings.h"
+#include "server/mods.h"
 #include "util/base64.h"
 #include "util/sha1.h"
 #include "util/hex.h"
@@ -139,7 +139,60 @@ v3f ServerSoundParams::getPos(ServerEnvironment *env, bool *pos_exists) const
 	return v3f(0,0,0);
 }
 
+void Server::ShutdownState::reset()
+{
+	m_timer = 0.0f;
+	message.clear();
+	should_reconnect = false;
+	is_requested = false;
+}
 
+void Server::ShutdownState::trigger(float delay, const std::string &msg, bool reconnect)
+{
+	m_timer = delay;
+	message = msg;
+	should_reconnect = reconnect;
+}
+
+void Server::ShutdownState::tick(float dtime, Server *server)
+{
+	if (m_timer <= 0.0f)
+		return;
+
+	// Timed shutdown
+	static const float shutdown_msg_times[] =
+	{
+		1, 2, 3, 4, 5, 10, 20, 40, 60, 120, 180, 300, 600, 1200, 1800, 3600
+	};
+
+	// Automated messages
+	if (m_timer < shutdown_msg_times[ARRLEN(shutdown_msg_times) - 1]) {
+		for (float t : shutdown_msg_times) {
+			// If shutdown timer matches an automessage, shot it
+			if (m_timer > t && m_timer - dtime < t) {
+				std::wstring periodicMsg = getShutdownTimerMessage();
+
+				infostream << wide_to_utf8(periodicMsg).c_str() << std::endl;
+				server->SendChatMessage(PEER_ID_INEXISTENT, periodicMsg);
+				break;
+			}
+		}
+	}
+
+	m_timer -= dtime;
+	if (m_timer < 0.0f) {
+		m_timer = 0.0f;
+		is_requested = true;
+	}
+}
+
+std::wstring Server::ShutdownState::getShutdownTimerMessage() const
+{
+	std::wstringstream ws;
+	ws << L"*** Server shutting down in "
+		<< duration_to_string(myround(m_timer)).c_str() << ".";
+	return ws.str();
+}
 
 /*
 	Server
@@ -167,7 +220,6 @@ Server::Server(
 	m_itemdef(createItemDefManager()),
 	m_nodedef(createNodeDefManager()),
 	m_craftdef(createCraftDefManager()),
-	m_event(new EventManager()),
 	m_uptime(0),
 	m_clients(m_con),
 	m_admin_chat(iface),
@@ -175,22 +227,96 @@ Server::Server(
 {
 	m_lag = g_settings->getFloat("dedicated_server_step");
 
-	if (path_world.empty())
+	if (m_path_world.empty())
 		throw ServerError("Supplied empty world path");
 
-	if(!gamespec.isValid())
+	if (!gamespec.isValid())
 		throw ServerError("Supplied invalid gamespec");
+}
 
-	infostream<<"Server created for gameid \""<<m_gamespec.id<<"\"";
-	if(m_simple_singleplayer_mode)
-		infostream<<" in simple singleplayer mode"<<std::endl;
+Server::~Server()
+{
+	infostream << "Server destructing" << std::endl;
+
+	// Send shutdown message
+	SendChatMessage(PEER_ID_INEXISTENT, ChatMessage(CHATMESSAGE_TYPE_ANNOUNCE,
+			L"*** Server shutting down"));
+
+	if (m_env) {
+		MutexAutoLock envlock(m_env_mutex);
+
+		infostream << "Server: Saving players" << std::endl;
+		m_env->saveLoadedPlayers();
+
+		infostream << "Server: Kicking players" << std::endl;
+		std::string kick_msg;
+		bool reconnect = false;
+		if (isShutdownRequested()) {
+			reconnect = m_shutdown_state.should_reconnect;
+			kick_msg = m_shutdown_state.message;
+		}
+		if (kick_msg.empty()) {
+			kick_msg = g_settings->get("kick_msg_shutdown");
+		}
+		m_env->kickAllPlayers(SERVER_ACCESSDENIED_SHUTDOWN,
+			kick_msg, reconnect);
+	}
+
+	// Do this before stopping the server in case mapgen callbacks need to access
+	// server-controlled resources (like ModStorages). Also do them before
+	// shutdown callbacks since they may modify state that is finalized in a
+	// callback.
+	if (m_emerge)
+		m_emerge->stopThreads();
+
+	if (m_env) {
+		MutexAutoLock envlock(m_env_mutex);
+
+		// Execute script shutdown hooks
+		infostream << "Executing shutdown hooks" << std::endl;
+		m_script->on_shutdown();
+
+		infostream << "Server: Saving environment metadata" << std::endl;
+		m_env->saveMeta();
+	}
+
+	// Stop threads
+	if (m_thread) {
+		stop();
+		delete m_thread;
+	}
+
+	// Delete things in the reverse order of creation
+	delete m_emerge;
+	delete m_env;
+	delete m_rollback;
+	delete m_banmanager;
+	delete m_itemdef;
+	delete m_nodedef;
+	delete m_craftdef;
+
+	// Deinitialize scripting
+	infostream << "Server: Deinitializing scripting" << std::endl;
+	delete m_script;
+
+	// Delete detached inventories
+	for (auto &detached_inventory : m_detached_inventories) {
+		delete detached_inventory.second;
+	}
+}
+
+void Server::init()
+{
+	infostream << "Server created for gameid \"" << m_gamespec.id << "\"";
+	if (m_simple_singleplayer_mode)
+		infostream << " in simple singleplayer mode" << std::endl;
 	else
-		infostream<<std::endl;
-	infostream<<"- world:  "<<m_path_world<<std::endl;
-	infostream<<"- game:   "<<m_gamespec.path<<std::endl;
+		infostream << std::endl;
+	infostream << "- world:  " << m_path_world << std::endl;
+	infostream << "- game:   " << m_gamespec.path << std::endl;
 
 	// Create world if it doesn't exist
-	if(!loadGameConfAndInitWorld(m_path_world, m_gamespec))
+	if (!loadGameConfAndInitWorld(m_path_world, m_gamespec))
 		throw ServerError("Failed to initialize world");
 
 	// Create server thread
@@ -203,48 +329,27 @@ Server::Server(
 	std::string ban_path = m_path_world + DIR_DELIM "ipban.txt";
 	m_banmanager = new BanManager(ban_path);
 
-	ServerModConfiguration modconf(m_path_world);
-	m_mods = modconf.getMods();
-	std::vector<ModSpec> unsatisfied_mods = modconf.getUnsatisfiedMods();
+	m_modmgr = std::unique_ptr<ServerModManager>(new ServerModManager(m_path_world));
+	std::vector<ModSpec> unsatisfied_mods = m_modmgr->getUnsatisfiedMods();
 	// complain about mods with unsatisfied dependencies
-	if (!modconf.isConsistent()) {
-		modconf.printUnsatisfiedModsError();
+	if (!m_modmgr->isConsistent()) {
+		m_modmgr->printUnsatisfiedModsError();
 	}
 
 	//lock environment
 	MutexAutoLock envlock(m_env_mutex);
 
 	// Create the Map (loads map_meta.txt, overriding configured mapgen params)
-	ServerMap *servermap = new ServerMap(path_world, this, m_emerge);
+	ServerMap *servermap = new ServerMap(m_path_world, this, m_emerge);
 
 	// Initialize scripting
-	infostream<<"Server: Initializing Lua"<<std::endl;
+	infostream << "Server: Initializing Lua" << std::endl;
 
 	m_script = new ServerScripting(this);
 
 	m_script->loadMod(getBuiltinLuaPath() + DIR_DELIM "init.lua", BUILTIN_MOD_NAME);
 
-	// Print mods
-	infostream << "Server: Loading mods: ";
-	for (std::vector<ModSpec>::const_iterator i = m_mods.begin();
-			i != m_mods.end(); ++i) {
-		infostream << (*i).name << " ";
-	}
-	infostream << std::endl;
-	// Load and run "mod" scripts
-	for (std::vector<ModSpec>::const_iterator it = m_mods.begin();
-			it != m_mods.end(); ++it) {
-		const ModSpec &mod = *it;
-		if (!string_allowed(mod.name, MODNAME_ALLOWED_CHARS)) {
-			throw ModError("Error loading mod \"" + mod.name +
-				"\": Mod name does not follow naming conventions: "
-				"Only characters [a-z0-9_] are allowed.");
-		}
-		std::string script_path = mod.path + DIR_DELIM + "init.lua";
-		infostream << "  [" << padStringRight(mod.name, 12) << "] [\""
-				<< script_path << "\"]" << std::endl;
-		m_script->loadMod(script_path, mod.name);
-	}
+	m_modmgr->loadMods(m_script);
 
 	// Read Textures and calculate sha1 sums
 	fillMediaCache();
@@ -281,8 +386,7 @@ Server::Server(
 	// Initialize mapgens
 	m_emerge->initMapgens(servermap->getMapgenParams());
 
-	m_enable_rollback_recording = g_settings->getBool("enable_rollback_recording");
-	if (m_enable_rollback_recording) {
+	if (g_settings->getBool("enable_rollback_recording")) {
 		// Create rollback manager
 		m_rollback = new RollbackManager(m_path_world, this);
 	}
@@ -293,87 +397,12 @@ Server::Server(
 	// Register us to receive map edit events
 	servermap->addEventReceiver(this);
 
-	// If file exists, load environment metadata
-	if (fs::PathExists(m_path_world + DIR_DELIM "env_meta.txt")) {
-		infostream << "Server: Loading environment metadata" << std::endl;
-		m_env->loadMeta();
-	} else {
-		m_env->loadDefaultMeta();
-	}
+	m_env->loadMeta();
 
 	m_liquid_transform_every = g_settings->getFloat("liquid_update");
 	m_max_chatmessage_length = g_settings->getU16("chat_message_max_size");
-	m_csm_flavour_limits = g_settings->getU64("csm_flavour_limits");
-	m_csm_noderange_limit = g_settings->getU32("csm_flavour_noderange_limit");
-}
-
-Server::~Server()
-{
-	infostream << "Server destructing" << std::endl;
-
-	// Send shutdown message
-	SendChatMessage(PEER_ID_INEXISTENT, ChatMessage(CHATMESSAGE_TYPE_ANNOUNCE,
-			L"*** Server shutting down"));
-
-	{
-		MutexAutoLock envlock(m_env_mutex);
-		
-		infostream << "Server: Saving players" << std::endl;
-		m_env->saveLoadedPlayers();
-
-		infostream << "Server: Kicking players" << std::endl;
-		std::string kick_msg;
-		bool reconnect = false;
-		if (getShutdownRequested()) {
-			reconnect = m_shutdown_ask_reconnect;
-			kick_msg = m_shutdown_msg;
-		}
-		if (kick_msg.empty()) {
-			kick_msg = g_settings->get("kick_msg_shutdown");
-		}
-		m_env->kickAllPlayers(SERVER_ACCESSDENIED_SHUTDOWN,
-			kick_msg, reconnect);
-	}
-
-	// Do this before stopping the server in case mapgen callbacks need to access
-	// server-controlled resources (like ModStorages). Also do them before
-	// shutdown callbacks since they may modify state that is finalized in a
-	// callback.
-	m_emerge->stopThreads();
-
-	{
-		MutexAutoLock envlock(m_env_mutex);
-
-		// Execute script shutdown hooks
-		infostream << "Executing shutdown hooks" << std::endl;
-		m_script->on_shutdown();
-
-		infostream << "Server: Saving environment metadata" << std::endl;
-		m_env->saveMeta();
-	}
-
-	// Stop threads
-	stop();
-	delete m_thread;
-
-	// Delete things in the reverse order of creation
-	delete m_emerge;
-	delete m_env;
-	delete m_rollback;
-	delete m_banmanager;
-	delete m_event;
-	delete m_itemdef;
-	delete m_nodedef;
-	delete m_craftdef;
-
-	// Deinitialize scripting
-	infostream << "Server: Deinitializing scripting" << std::endl;
-	delete m_script;
-
-	// Delete detached inventories
-	for (auto &detached_inventory : m_detached_inventories) {
-		delete detached_inventory.second;
-	}
+	m_csm_restriction_flags = g_settings->getU64("csm_restriction_flags");
+	m_csm_restriction_noderange = g_settings->getU32("csm_restriction_noderange");
 }
 
 void Server::start()
@@ -392,7 +421,7 @@ void Server::start()
 	m_thread->start();
 
 	// ASCII art for the win!
-	actionstream
+	std::cerr
 		<< "        .__               __                   __   " << std::endl
 		<< "  _____ |__| ____   _____/  |_  ____   _______/  |_ " << std::endl
 		<< " /     \\|  |/    \\_/ __ \\   __\\/ __ \\ /  ___/\\   __\\" << std::endl
@@ -558,8 +587,7 @@ void Server::AsyncRunStep(bool initial_step)
 		/*
 			Set the modified blocks unsent for all the clients
 		*/
-		if(!modified_blocks.empty())
-		{
+		if (!modified_blocks.empty()) {
 			SetBlocksNotSent(modified_blocks);
 		}
 	}
@@ -581,7 +609,7 @@ void Server::AsyncRunStep(bool initial_step)
 					m_lag,
 					m_gamespec.id,
 					Mapgen::getMapgenName(m_emerge->mgparams->mgtype),
-					m_mods,
+					m_modmgr->getMods(),
 					m_dedicated);
 			counter = 0.01;
 		}
@@ -857,13 +885,13 @@ void Server::AsyncRunStep(bool initial_step)
 			case MEET_BLOCK_NODE_METADATA_CHANGED:
 				infostream << "Server: MEET_BLOCK_NODE_METADATA_CHANGED" << std::endl;
 						prof.add("MEET_BLOCK_NODE_METADATA_CHANGED", 1);
-						setBlockNotSent(event->p);
+						m_clients.markBlockposAsNotSent(event->p);
 				break;
 			case MEET_OTHER:
 				infostream << "Server: MEET_OTHER" << std::endl;
 				prof.add("MEET_OTHER", 1);
 				for (const v3s16 &modified_block : event->modified_blocks) {
-					setBlockNotSent(modified_block);
+					m_clients.markBlockposAsNotSent(modified_block);
 				}
 				break;
 			default:
@@ -946,38 +974,7 @@ void Server::AsyncRunStep(bool initial_step)
 		}
 	}
 
-	// Timed shutdown
-	static const float shutdown_msg_times[] =
-	{
-		1, 2, 3, 4, 5, 10, 15, 20, 25, 30, 45, 60, 120, 180, 300, 600, 1200, 1800, 3600
-	};
-
-	if (m_shutdown_timer > 0.0f) {
-		// Automated messages
-		if (m_shutdown_timer < shutdown_msg_times[ARRLEN(shutdown_msg_times) - 1]) {
-			for (u16 i = 0; i < ARRLEN(shutdown_msg_times) - 1; i++) {
-				// If shutdown timer matches an automessage, shot it
-				if (m_shutdown_timer > shutdown_msg_times[i] &&
-					m_shutdown_timer - dtime < shutdown_msg_times[i]) {
-					std::wstringstream ws;
-
-					ws << L"*** Server shutting down in "
-						<< duration_to_string(myround(m_shutdown_timer - dtime)).c_str()
-						<< ".";
-
-					infostream << wide_to_utf8(ws.str()).c_str() << std::endl;
-					SendChatMessage(PEER_ID_INEXISTENT, ws.str());
-					break;
-				}
-			}
-		}
-
-		m_shutdown_timer -= dtime;
-		if (m_shutdown_timer < 0.0f) {
-			m_shutdown_timer = 0.0f;
-			m_shutdown_requested = true;
-		}
-	}
+	m_shutdown_state.tick(dtime, this);
 }
 
 void Server::Receive()
@@ -1056,16 +1053,12 @@ PlayerSAO* Server::StageTwoClientInit(session_t peer_id)
 	if (playersao->isDead())
 		SendDeathscreen(peer_id, false, v3f(0,0,0));
 	else
-		SendPlayerHPOrDie(playersao);
+		SendPlayerHPOrDie(playersao,
+				PlayerHPChangeReason(PlayerHPChangeReason::SET_HP));
 
 	// Send Breath
 	SendPlayerBreath(playersao);
 
-	// Note things in chat if not in simple singleplayer mode
-	if (!m_simple_singleplayer_mode && g_settings->getBool("show_statusline_on_connect")) {
-		// Send information about server to player in chat
-		SendChatMessage(peer_id, ChatMessage(CHATMESSAGE_TYPE_SYSTEM, getStatusString()));
-	}
 	Address addr = getPeerAddress(player->getPeerId());
 	std::string ip_str = addr.serializeString();
 	actionstream<<player->getName() <<" [" << ip_str << "] joins game. " << std::endl;
@@ -1186,9 +1179,7 @@ void Server::setTimeOfDay(u32 time)
 
 void Server::onMapEditEvent(MapEditEvent *event)
 {
-	if(m_ignore_map_edit_events)
-		return;
-	if(m_ignore_map_edit_events_area.contains(event->getArea()))
+	if (m_ignore_map_edit_events_area.contains(event->getArea()))
 		return;
 	MapEditEvent *e = event->clone();
 	m_unsent_map_edit_queue.push(e);
@@ -1262,7 +1253,7 @@ void Server::setInventoryModified(const InventoryLocation &loc, bool playerSend)
 		if (block)
 			block->raiseModified(MOD_STATE_WRITE_NEEDED);
 
-		setBlockNotSent(blockpos);
+		m_clients.markBlockposAsNotSent(blockpos);
 	}
 		break;
 	case InventoryLocation::DETACHED:
@@ -1419,7 +1410,7 @@ void Server::SendMovement(session_t peer_id)
 	Send(&pkt);
 }
 
-void Server::SendPlayerHPOrDie(PlayerSAO *playersao)
+void Server::SendPlayerHPOrDie(PlayerSAO *playersao, const PlayerHPChangeReason &reason)
 {
 	if (!g_settings->getBool("enable_damage"))
 		return;
@@ -1430,7 +1421,7 @@ void Server::SendPlayerHPOrDie(PlayerSAO *playersao)
 	if (is_alive)
 		SendPlayerHP(peer_id);
 	else
-		DiePlayer(peer_id);
+		DiePlayer(peer_id, reason);
 }
 
 void Server::SendHP(session_t peer_id, u16 hp)
@@ -1775,17 +1766,11 @@ void Server::SendSetSky(session_t peer_id, const video::SColor &bgcolor,
 	Send(&pkt);
 }
 
-void Server::SendCloudParams(session_t peer_id, float density,
-		const video::SColor &color_bright,
-		const video::SColor &color_ambient,
-		float height,
-		float thickness,
-		const v2f &speed)
+void Server::SendCloudParams(session_t peer_id, const CloudParams &params)
 {
 	NetworkPacket pkt(TOCLIENT_CLOUD_PARAMS, 0, peer_id);
-	pkt << density << color_bright << color_ambient
-			<< height << thickness << speed;
-
+	pkt << params.density << params.color_bright << params.color_ambient
+			<< params.height << params.thickness << params.speed;
 	Send(&pkt);
 }
 
@@ -1903,11 +1888,23 @@ void Server::SendPlayerInventoryFormspec(session_t peer_id)
 {
 	RemotePlayer *player = m_env->getPlayer(peer_id);
 	assert(player);
-	if(player->getPeerId() == PEER_ID_INEXISTENT)
+	if (player->getPeerId() == PEER_ID_INEXISTENT)
 		return;
 
 	NetworkPacket pkt(TOCLIENT_INVENTORY_FORMSPEC, 0, peer_id);
 	pkt.putLongString(FORMSPEC_VERSION_STRING + player->inventory_formspec);
+	Send(&pkt);
+}
+
+void Server::SendPlayerFormspecPrepend(session_t peer_id)
+{
+	RemotePlayer *player = m_env->getPlayer(peer_id);
+	assert(player);
+	if (player->getPeerId() == PEER_ID_INEXISTENT)
+		return;
+
+	NetworkPacket pkt(TOCLIENT_FORMSPEC_PREPEND, 0, peer_id);
+	pkt << FORMSPEC_VERSION_STRING + player->formspec_prepend;
 	Send(&pkt);
 }
 
@@ -1932,11 +1929,11 @@ void Server::SendActiveObjectMessages(session_t peer_id, const std::string &data
 			&pkt, reliable);
 }
 
-void Server::SendCSMFlavourLimits(session_t peer_id)
+void Server::SendCSMRestrictionFlags(session_t peer_id)
 {
-	NetworkPacket pkt(TOCLIENT_CSM_FLAVOUR_LIMITS,
-		sizeof(m_csm_flavour_limits) + sizeof(m_csm_noderange_limit), peer_id);
-	pkt << m_csm_flavour_limits << m_csm_noderange_limit;
+	NetworkPacket pkt(TOCLIENT_CSM_RESTRICTION_FLAGS,
+		sizeof(m_csm_restriction_flags) + sizeof(m_csm_restriction_noderange), peer_id);
+	pkt << m_csm_restriction_flags << m_csm_restriction_noderange;
 	Send(&pkt);
 }
 
@@ -2153,22 +2150,9 @@ void Server::sendAddNode(v3s16 p, MapNode n, u16 ignore_id,
 	}
 }
 
-void Server::setBlockNotSent(v3s16 p)
-{
-	std::vector<session_t> clients = m_clients.getClientIDs();
-	m_clients.lock();
-	for (const session_t i : clients) {
-		RemoteClient *client = m_clients.lockedGetClientNoEx(i);
-		client->SetBlockNotSent(p);
-	}
-	m_clients.unlock();
-}
-
 void Server::SendBlockNoLock(session_t peer_id, MapBlock *block, u8 ver,
 		u16 net_proto_version)
 {
-	v3s16 p = block->getPos();
-
 	/*
 		Create a packet with the block in the right format
 	*/
@@ -2180,7 +2164,7 @@ void Server::SendBlockNoLock(session_t peer_id, MapBlock *block, u8 ver,
 
 	NetworkPacket pkt(TOCLIENT_BLOCKDATA, 2 + 2 + 2 + 2 + s.size(), peer_id);
 
-	pkt << p;
+	pkt << block->getPos();
 	pkt.putRawString(s.c_str(), s.size());
 	Send(&pkt);
 }
@@ -2257,13 +2241,7 @@ void Server::fillMediaCache()
 
 	// Collect all media file paths
 	std::vector<std::string> paths;
-	for (const ModSpec &mod : m_mods) {
-		paths.push_back(mod.path + DIR_DELIM + "textures");
-		paths.push_back(mod.path + DIR_DELIM + "sounds");
-		paths.push_back(mod.path + DIR_DELIM + "media");
-		paths.push_back(mod.path + DIR_DELIM + "models");
-		paths.push_back(mod.path + DIR_DELIM + "locale");
-	}
+	m_modmgr->getModsMediaPaths(paths);
 	fs::GetRecursiveDirs(paths, m_gamespec.path + DIR_DELIM + "textures");
 	fs::GetRecursiveDirs(paths, porting::path_user + DIR_DELIM + "textures" + DIR_DELIM + "server");
 
@@ -2533,7 +2511,7 @@ void Server::sendDetachedInventories(session_t peer_id)
 	Something random
 */
 
-void Server::DiePlayer(session_t peer_id)
+void Server::DiePlayer(session_t peer_id, const PlayerHPChangeReason &reason)
 {
 	PlayerSAO *playersao = getPlayerSAO(peer_id);
 	// In some rare cases this can be NULL -- if the player is disconnected
@@ -2545,10 +2523,11 @@ void Server::DiePlayer(session_t peer_id)
 			<< playersao->getPlayer()->getName()
 			<< " dies" << std::endl;
 
-	playersao->setHP(0);
+	playersao->setHP(0, reason);
+	playersao->clearParentAttachment();
 
 	// Trigger scripted stuff
-	m_script->on_dieplayer(playersao);
+	m_script->on_dieplayer(playersao, reason);
 
 	SendPlayerHP(peer_id);
 	SendDeathscreen(peer_id, false, v3f(0,0,0));
@@ -2563,7 +2542,8 @@ void Server::RespawnPlayer(session_t peer_id)
 			<< playersao->getPlayer()->getName()
 			<< " respawns" << std::endl;
 
-	playersao->setHP(playersao->accessObjectProperties()->hp_max);
+	playersao->setHP(playersao->accessObjectProperties()->hp_max,
+			PlayerHPChangeReason(PlayerHPChangeReason::RESPAWN));
 	playersao->setBreath(playersao->accessObjectProperties()->breath_max);
 
 	bool repositioned = m_script->on_respawnplayer(playersao);
@@ -2672,6 +2652,9 @@ void Server::DeleteClient(session_t peer_id, ClientDeletionReason reason)
 			PlayerSAO *playersao = player->getPlayerSAO();
 			assert(playersao);
 
+			playersao->clearChildAttachments();
+			playersao->clearParentAttachment();
+
 			// inform connected clients
 			NetworkPacket notice(TOCLIENT_UPDATE_PLAYER_LIST, 0, PEER_ID_INEXISTENT);
 			// (u16) 1 + std::string represents a vector serialization representation
@@ -2725,6 +2708,10 @@ void Server::DeleteClient(session_t peer_id, ClientDeletionReason reason)
 
 void Server::UpdateCrafting(RemotePlayer *player)
 {
+	InventoryList *clist = player->inventory.getList("craft");
+	if (!clist || clist->getSize() == 0)
+		return;
+
 	// Get a preview for crafting
 	ItemStack preview;
 	InventoryLocation loc;
@@ -2732,13 +2719,13 @@ void Server::UpdateCrafting(RemotePlayer *player)
 	std::vector<ItemStack> output_replacements;
 	getCraftingResult(&player->inventory, preview, output_replacements, false, this);
 	m_env->getScriptIface()->item_CraftPredict(preview, player->getPlayerSAO(),
-			(&player->inventory)->getList("craft"), loc);
+			clist, loc);
 
-	// Put the new preview in
 	InventoryList *plist = player->inventory.getList("craftpreview");
-	sanity_check(plist);
-	sanity_check(plist->getSize() >= 1);
-	plist->changeItem(0, preview);
+	if (plist && plist->getSize() >= 1) {
+		// Put the new preview in
+		plist->changeItem(0, preview);
+	}
 }
 
 void Server::handleChatInterfaceEvent(ChatEvent *evt)
@@ -2970,6 +2957,14 @@ void Server::reportInventoryFormspecModified(const std::string &name)
 	SendPlayerInventoryFormspec(player->getPeerId());
 }
 
+void Server::reportFormspecPrependModified(const std::string &name)
+{
+	RemotePlayer *player = m_env->getPlayer(name.c_str());
+	if (!player)
+		return;
+	SendPlayerFormspecPrepend(player->getPeerId());
+}
+
 void Server::setIpBanned(const std::string &ip, const std::string &name)
 {
 	m_banmanager->add(ip, name);
@@ -3090,11 +3085,6 @@ bool Server::hudSetHotbarItemcount(RemotePlayer *player, s32 hotbar_itemcount)
 	return true;
 }
 
-s32 Server::hudGetHotbarItemcount(RemotePlayer *player) const
-{
-	return player->getHotbarItemcount();
-}
-
 void Server::hudSetHotbarImage(RemotePlayer *player, std::string name)
 {
 	if (!player)
@@ -3102,13 +3092,6 @@ void Server::hudSetHotbarImage(RemotePlayer *player, std::string name)
 
 	player->setHotbarImage(name);
 	SendHUDSetParam(player->getPeerId(), HUD_PARAM_HOTBAR_IMAGE, name);
-}
-
-std::string Server::hudGetHotbarImage(RemotePlayer *player)
-{
-	if (!player)
-		return "";
-	return player->getHotbarImage();
 }
 
 void Server::hudSetHotbarSelectedImage(RemotePlayer *player, std::string name)
@@ -3120,64 +3103,41 @@ void Server::hudSetHotbarSelectedImage(RemotePlayer *player, std::string name)
 	SendHUDSetParam(player->getPeerId(), HUD_PARAM_HOTBAR_SELECTED_IMAGE, name);
 }
 
-const std::string& Server::hudGetHotbarSelectedImage(RemotePlayer *player) const
-{
-	return player->getHotbarSelectedImage();
-}
-
 Address Server::getPeerAddress(session_t peer_id)
 {
 	return m_con->GetPeerAddress(peer_id);
 }
 
-bool Server::setLocalPlayerAnimations(RemotePlayer *player,
+void Server::setLocalPlayerAnimations(RemotePlayer *player,
 		v2s32 animation_frames[4], f32 frame_speed)
 {
-	if (!player)
-		return false;
-
+	sanity_check(player);
 	player->setLocalAnimations(animation_frames, frame_speed);
 	SendLocalPlayerAnimations(player->getPeerId(), animation_frames, frame_speed);
-	return true;
 }
 
-bool Server::setPlayerEyeOffset(RemotePlayer *player, v3f first, v3f third)
+void Server::setPlayerEyeOffset(RemotePlayer *player, const v3f &first, const v3f &third)
 {
-	if (!player)
-		return false;
-
+	sanity_check(player);
 	player->eye_offset_first = first;
 	player->eye_offset_third = third;
 	SendEyeOffset(player->getPeerId(), first, third);
-	return true;
 }
 
-bool Server::setSky(RemotePlayer *player, const video::SColor &bgcolor,
+void Server::setSky(RemotePlayer *player, const video::SColor &bgcolor,
 	const std::string &type, const std::vector<std::string> &params,
 	bool &clouds)
 {
-	if (!player)
-		return false;
-
+	sanity_check(player);
 	player->setSky(bgcolor, type, params, clouds);
 	SendSetSky(player->getPeerId(), bgcolor, type, params, clouds);
-	return true;
 }
 
-bool Server::setClouds(RemotePlayer *player, float density,
-	const video::SColor &color_bright,
-	const video::SColor &color_ambient,
-	float height,
-	float thickness,
-	const v2f &speed)
+void Server::setClouds(RemotePlayer *player, const CloudParams &params)
 {
-	if (!player)
-		return false;
-
-	SendCloudParams(player->getPeerId(), density,
-			color_bright, color_ambient, height,
-			thickness, speed);
-	return true;
+	sanity_check(player);
+	player->setCloudParams(params);
+	SendCloudParams(player->getPeerId(), params);
 }
 
 bool Server::overrideDayNightRatio(RemotePlayer *player, bool do_override,
@@ -3305,7 +3265,8 @@ bool Server::rollbackRevertActions(const std::list<RollbackAction> &actions,
 	ServerMap *map = (ServerMap*)(&m_env->getMap());
 
 	// Fail if no actions to handle
-	if(actions.empty()){
+	if (actions.empty()) {
+		assert(log);
 		log->push_back("Nothing to do.");
 		return false;
 	}
@@ -3361,11 +3322,6 @@ u16 Server::allocateUnknownNodeId(const std::string &name)
 	return m_nodedef->allocateDummy(name);
 }
 
-MtEventManager *Server::getEventManager()
-{
-	return m_event;
-}
-
 IWritableItemDefManager *Server::getWritableItemDefManager()
 {
 	return m_itemdef;
@@ -3381,22 +3337,19 @@ IWritableCraftDefManager *Server::getWritableCraftDefManager()
 	return m_craftdef;
 }
 
+const std::vector<ModSpec> & Server::getMods() const
+{
+	return m_modmgr->getMods();
+}
+
 const ModSpec *Server::getModSpec(const std::string &modname) const
 {
-	std::vector<ModSpec>::const_iterator it;
-	for (it = m_mods.begin(); it != m_mods.end(); ++it) {
-		const ModSpec &mod = *it;
-		if (mod.name == modname)
-			return &mod;
-	}
-	return NULL;
+	return m_modmgr->getModSpec(modname);
 }
 
 void Server::getModNames(std::vector<std::string> &modlist)
 {
-	std::vector<ModSpec>::iterator it;
-	for (it = m_mods.begin(); it != m_mods.end(); ++it)
-		modlist.push_back(it->name);
+	m_modmgr->getModNames(modlist);
 }
 
 std::string Server::getBuiltinLuaPath()
@@ -3463,39 +3416,36 @@ v3f Server::findSpawnPos()
 
 void Server::requestShutdown(const std::string &msg, bool reconnect, float delay)
 {
-	m_shutdown_timer = delay;
-	m_shutdown_msg = msg;
-	m_shutdown_ask_reconnect = reconnect;
-
 	if (delay == 0.0f) {
 	// No delay, shutdown immediately
-		m_shutdown_requested = true;
+		m_shutdown_state.is_requested = true;
 		// only print to the infostream, a chat message saying
 		// "Server Shutting Down" is sent when the server destructs.
 		infostream << "*** Immediate Server shutdown requested." << std::endl;
-	} else if (delay < 0.0f && m_shutdown_timer > 0.0f) {
-	// Negative delay, cancel shutdown if requested
-		m_shutdown_timer = 0.0f;
-		m_shutdown_msg = "";
-		m_shutdown_ask_reconnect = false;
-		m_shutdown_requested = false;
+	} else if (delay < 0.0f && m_shutdown_state.isTimerRunning()) {
+		// Negative delay, cancel shutdown if requested
+		m_shutdown_state.reset();
 		std::wstringstream ws;
 
 		ws << L"*** Server shutdown canceled.";
 
 		infostream << wide_to_utf8(ws.str()).c_str() << std::endl;
 		SendChatMessage(PEER_ID_INEXISTENT, ws.str());
+		// m_shutdown_* are already handled, skip.
+		return;
 	} else if (delay > 0.0f) {
 	// Positive delay, tell the clients when the server will shut down
 		std::wstringstream ws;
 
 		ws << L"*** Server shutting down in "
-				<< duration_to_string(myround(m_shutdown_timer)).c_str()
+				<< duration_to_string(myround(delay)).c_str()
 				<< ".";
 
 		infostream << wide_to_utf8(ws.str()).c_str() << std::endl;
 		SendChatMessage(PEER_ID_INEXISTENT, ws.str());
 	}
+
+	m_shutdown_state.trigger(delay, msg, reconnect);
 }
 
 PlayerSAO* Server::emergePlayer(const char *name, session_t peer_id, u16 proto_version)
@@ -3583,7 +3533,7 @@ void dedicated_server_loop(Server &server, bool &kill)
 		}
 		server.step(steplen);
 
-		if (server.getShutdownRequested() || kill)
+		if (server.isShutdownRequested() || kill)
 			break;
 
 		/*

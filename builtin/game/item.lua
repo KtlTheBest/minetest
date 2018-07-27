@@ -33,7 +33,7 @@ function core.get_pointed_thing_position(pointed_thing, above)
 		-- The position where a node would be dug
 		return pointed_thing.under
 	elseif pointed_thing.type == "object" then
-		return pointed_thing.ref and pointed_thing.ref:getpos()
+		return pointed_thing.ref and pointed_thing.ref:get_pos()
 	end
 end
 
@@ -261,7 +261,8 @@ local function make_log(name)
 	return name ~= "" and core.log or function() end
 end
 
-function core.item_place_node(itemstack, placer, pointed_thing, param2)
+function core.item_place_node(itemstack, placer, pointed_thing, param2,
+		prevent_after_place)
 	local def = itemstack:get_definition()
 	if def.type ~= "node" or pointed_thing.type ~= "node" then
 		return itemstack, false
@@ -330,7 +331,7 @@ function core.item_place_node(itemstack, placer, pointed_thing, param2)
 	-- Calculate the direction for furnaces and chests and stuff
 	elseif (def.paramtype2 == "facedir" or
 			def.paramtype2 == "colorfacedir") and not param2 then
-		local placer_pos = placer and placer:getpos()
+		local placer_pos = placer and placer:get_pos()
 		if placer_pos then
 			local dir = {
 				x = above.x - placer_pos.x,
@@ -375,7 +376,7 @@ function core.item_place_node(itemstack, placer, pointed_thing, param2)
 	local take_item = true
 
 	-- Run callback
-	if def.after_place_node then
+	if def.after_place_node and not prevent_after_place then
 		-- Deepcopy place_to and pointed_thing because callback can modify it
 		local place_to_copy = {x=place_to.x, y=place_to.y, z=place_to.z}
 		local pointed_thing_copy = copy_pointed_thing(pointed_thing)
@@ -477,7 +478,7 @@ function core.do_item_eat(hp_change, replace_with_item, itemstack, user, pointed
 				if inv and inv:room_for_item("main", {name=replace_with_item}) then
 					inv:add_item("main", replace_with_item)
 				else
-					local pos = user:getpos()
+					local pos = user:get_pos()
 					pos.y = math.floor(pos.y + 0.5)
 					core.add_item(pos, replace_with_item)
 				end

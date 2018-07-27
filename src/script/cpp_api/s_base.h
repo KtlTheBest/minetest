@@ -24,6 +24,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include <thread>
 #include <mutex>
 #include <unordered_map>
+#include "common/helper.h"
 #include "util/basic_macros.h"
 
 extern "C" {
@@ -72,8 +73,9 @@ class IGameDef;
 class Environment;
 class GUIEngine;
 class ServerActiveObject;
+struct PlayerHPChangeReason;
 
-class ScriptApiBase {
+class ScriptApiBase : protected LuaHelper {
 public:
 	ScriptApiBase(ScriptingType type);
 	// fake constructor to allow script API classes (e.g ScriptApiEnv) to virtually inherit from this one.
@@ -139,11 +141,13 @@ protected:
 
 	void objectrefGetOrCreate(lua_State *L, ServerActiveObject *cobj);
 
+	void pushPlayerHPChangeReason(lua_State *L, const PlayerHPChangeReason& reason);
+
 	std::recursive_mutex m_luastackmutex;
 	std::string     m_last_run_mod;
 	bool            m_secure = false;
 #ifdef SCRIPTAPI_LOCK_DEBUG
-	int             m_lock_recursion_count;
+	int             m_lock_recursion_count{};
 	std::thread::id m_owning_thread;
 #endif
 

@@ -20,6 +20,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "common/c_internal.h"
 #include "debug.h"
 #include "log.h"
+#include "porting.h"
 #include "settings.h"
 
 std::string script_get_backtrace(lua_State *L)
@@ -82,7 +83,7 @@ void script_error(lua_State *L, int pcall_result, const char *mod, const char *f
 		err_descr = "<no description>";
 
 	char buf[256];
-	snprintf(buf, sizeof(buf), "%s error from mod '%s' in callback %s(): ",
+	porting::mt_snprintf(buf, sizeof(buf), "%s error from mod '%s' in callback %s(): ",
 		err_type, mod, fxn);
 
 	std::string err_msg(buf);
@@ -153,7 +154,9 @@ void log_deprecated(lua_State *L, const std::string &message)
 		warningstream << message;
 		if (L) { // L can be NULL if we get called from scripting_game.cpp
 			lua_Debug ar;
-			FATAL_ERROR_IF(!lua_getstack(L, 2, &ar), "lua_getstack() failed");
+
+			if (!lua_getstack(L, 2, &ar))
+				FATAL_ERROR_IF(!lua_getstack(L, 1, &ar), "lua_getstack() failed");
 			FATAL_ERROR_IF(!lua_getinfo(L, "Sl", &ar), "lua_getinfo() failed");
 			warningstream << " (at " << ar.short_src << ":" << ar.currentline << ")";
 		}

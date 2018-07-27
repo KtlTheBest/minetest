@@ -32,6 +32,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "server.h"
 #include "util/strfnd.h"
 #include "client/clientevent.h"
+#include "client/sound.h"
 #include "network/clientopcodes.h"
 #include "network/connection.h"
 #include "script/scripting_client.h"
@@ -1323,11 +1324,20 @@ void Client::handleCommand_SrpBytesSandB(NetworkPacket* pkt)
 	Send(&resp_pkt);
 }
 
-void Client::handleCommand_CSMFlavourLimits(NetworkPacket *pkt)
+void Client::handleCommand_FormspecPrepend(NetworkPacket *pkt)
 {
-	*pkt >> m_csm_flavour_limits >> m_csm_noderange_limit;
+	LocalPlayer *player = m_env.getLocalPlayer();
+	assert(player != NULL);
 
-	// Now we have flavours, load mods if it's enabled
+	// Store formspec in LocalPlayer
+	*pkt >> player->formspec_prepend;
+}
+
+void Client::handleCommand_CSMRestrictionFlags(NetworkPacket *pkt)
+{
+	*pkt >> m_csm_restriction_flags >> m_csm_restriction_noderange;
+
+	// Restrictions were received -> load mods if it's enabled
 	// Note: this should be moved after mods receptions from server instead
 	loadMods();
 }
