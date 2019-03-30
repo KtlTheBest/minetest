@@ -82,6 +82,7 @@ struct ClientEvent
 			f32 size;
 			bool collisiondetection;
 			bool collision_removal;
+			bool object_collision;
 			bool vertical;
 			std::string *texture;
 			struct TileAnimationParams animation;
@@ -103,10 +104,11 @@ struct ClientEvent
 			f32 maxsize;
 			bool collisiondetection;
 			bool collision_removal;
+			bool object_collision;
 			u16 attached_id;
 			bool vertical;
 			std::string *texture;
-			u32 id;
+			u64 id;
 			struct TileAnimationParams animation;
 			u8 glow;
 		} add_particlespawner;
